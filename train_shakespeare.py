@@ -1,227 +1,341 @@
-#!/usr/bin/env python3
-"""Shakespeare training and generation script using neuralese recurrence architecture."""
-
+"""
+Train a Neuralese Recurrence language model on Shakespeare's works.
+With vocabulary trimming, UNK masking, and flexible LR schedulers.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset, DataLoader
 import argparse
-import json
 from pathlib import Path
+from collections import Counter
+import time
+import json
 
 
-class ShakespeareDataset(Dataset):
-    """Dataset for character-level text."""
-    def __init__(self, file_path, block_size=128):
+# ==============================================================================
+# Dataset
+# ==============================================================================
+class WordDataset(Dataset):
+    def __init__(self, file_path, block_size, min_freq=1, max_vocab=0):
+        self.block_size = block_size
         with open(file_path, 'r', encoding='utf-8') as f:
             text = f.read()
-        chars = sorted(list(set(text)))
-        self.vocab_size = len(chars)
-        self.stoi = {c: i for i, c in enumerate(chars)}
-        self.itos = {i: c for i, c in enumerate(chars)}
-        data = [self.stoi[c] for c in text]
-        self.data = torch.tensor(data, dtype=torch.long)
-        self.block_size = block_size
-        print(f"  Vocab: {self.vocab_size}, Block size: {self.block_size}")
+        words = text.split()
+        self.words = words
+        word_counts = Counter(words)
+        self.vocab = ['<PAD>', '<UNK>']
+        filtered = [(w, c) for w, c in word_counts.items() if c >= min_freq]
+        filtered.sort(key=lambda x: x[1], reverse=True)
+        if max_vocab > 0 and len(filtered) > max_vocab - 2:
+            filtered = filtered[:max_vocab - 2]
+        self.vocab += [w for w, _ in filtered]
+        self.word2idx = {w: i for i, w in enumerate(self.vocab)}
+        self.vocab_size = len(self.vocab)
+        self.data = [self.word2idx.get(w, self.word2idx['<UNK>']) for w in words]
+
     def __len__(self):
         return len(self.data) - self.block_size
+
     def __getitem__(self, idx):
-        chunk = self.data[idx:idx + self.block_size + 1]
-        return chunk[:-1], chunk[1:]
+        x = self.data[idx : idx + self.block_size]
+        y = self.data[idx + 1 : idx + self.block_size + 1]
+        return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
 
-class WordDataset(Dataset):
-    """Dataset for word-level text (pre-encoded token IDs)."""
-    def __init__(self, encoded, block_size=128):
-        self.data = torch.tensor(encoded, dtype=torch.long)
-        self.block_size = block_size
-        self.vocab_size = len(set(self.data))
-        print(f"  Vocab: {self.vocab_size}, Block size: {self.block_size}")
-    def __len__(self):
-        return len(self.data) - self.block_size
-    def __getitem__(self, idx):
-        chunk = self.data[idx:idx + self.block_size + 1]
-        return chunk[:-1], chunk[1:]
-
-
-class SimpleModel(nn.Module):
-    """Simple autoregressive model using LSTM."""
-    def __init__(self, vocab_size, embed_dim=64, hidden_dim=128):
+# ==============================================================================
+# Model
+# ==============================================================================
+class IterativeGRU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_layers):
         super().__init__()
-        self.vocab_size = vocab_size
+        self.gru = nn.GRU(input_dim, hidden_dim, num_layers=num_layers,
+                          batch_first=True, dropout=0.0)
+
+    def forward(self, x, h=None):
+        return self.gru(x, h)
+
+
+class CrossPassMemory(nn.Module):
+    def __init__(self, memory_slots, memory_dim, hidden_dim):
+        super().__init__()
+        self.memory_slots = memory_slots
+        self.memory_dim = memory_dim
+        self.hidden_dim = hidden_dim
+        self.mem_proj = nn.Linear(hidden_dim, memory_dim)
+        self.query_proj = nn.Linear(hidden_dim, memory_dim)
+        self.key_proj = nn.Linear(memory_dim, memory_dim)
+        self.value_proj = nn.Linear(memory_dim, hidden_dim)
+        self.register_buffer('memory', torch.zeros(memory_slots, memory_dim))
+        self.register_buffer('ptr', torch.tensor(0, dtype=torch.long))
+        self.is_full = False
+
+    def update(self, hidden_states):
+        if not self.training:
+            return
+        new_mem = hidden_states[:, -1, :].mean(dim=0)
+        new_mem = self.mem_proj(new_mem)
+        idx = self.ptr.item()
+        self.memory[idx] = new_mem.detach()
+        self.ptr = (idx + 1) % self.memory_slots
+        if self.ptr == 0:
+            self.is_full = True
+
+    def attend(self, query_hidden):
+        if not self.is_full and self.ptr == 0:
+            return torch.zeros_like(query_hidden)
+        num_slots = self.memory_slots if self.is_full else self.ptr.item()
+        mem = self.memory[:num_slots]
+        queries = self.query_proj(query_hidden)
+        keys = self.key_proj(mem)
+        values = self.value_proj(mem)
+        attn_weights = torch.matmul(queries, keys.T) / (self.memory_dim ** 0.5)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        context = torch.matmul(attn_weights, values)
+        return context
+
+
+class NeuraleseRecurrenceLM(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, num_layers, num_passes,
+                 memory_slots=0, memory_dim=None, dropout=0.1):
+        super().__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim)
-        self.lstm = nn.LSTM(embed_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, vocab_size)
+        self.input_proj = nn.Linear(embed_dim, hidden_dim)
+        self.gru_cell = IterativeGRU(hidden_dim, hidden_dim, num_layers)
+        self.num_passes = num_passes
+        self.use_memory = memory_slots > 0
+        if self.use_memory:
+            if memory_dim is None:
+                memory_dim = hidden_dim
+            self.memory = CrossPassMemory(memory_slots, memory_dim, hidden_dim)
+            self.memory_gate = nn.Linear(hidden_dim * 2, hidden_dim)
+        else:
+            self.memory = None
+        self.dropout = nn.Dropout(dropout)
+        self.output_proj = nn.Linear(hidden_dim, vocab_size)
+
     def forward(self, x):
-        x, _ = self.lstm(self.embedding(x))
-        return self.fc(x)
+        batch_size, seq_len = x.shape
+        emb = self.embedding(x)
+        h_in = self.input_proj(emb)
+        h_in = self.dropout(h_in)
+        h_state = None
+        for pass_idx in range(self.num_passes):
+            out, h_state = self.gru_cell(h_in, h_state)
+            if pass_idx < self.num_passes - 1:
+                residual = self.input_proj(emb)
+                h_in = self.dropout(out + residual)
+        if self.use_memory:
+            self.memory.update(out)
+            queries = out.reshape(-1, out.size(-1))
+            mem_ctx = self.memory.attend(queries)
+            mem_ctx = mem_ctx.reshape(batch_size, seq_len, -1)
+            combined = torch.cat([out, mem_ctx], dim=-1)
+            gate = torch.sigmoid(self.memory_gate(combined))
+            out = gate * out + (1 - gate) * mem_ctx
+        logits = self.output_proj(out)
+        return logits
 
 
+# ==============================================================================
+# Training helpers
+# ==============================================================================
+def train_epoch(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    for x, y in dataloader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def evaluate(model, dataloader, criterion, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = criterion(logits.view(-1, logits.size(-1)), y.view(-1))
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+
+def generate_text(model, start_words, word2idx, idx2word, block_size, device,
+                  max_new_tokens=100, temperature=0.8):
+    model.eval()
+    unk_idx = word2idx.get('<UNK>', None)
+    pad_idx = word2idx.get('<PAD>', None)
+    mask_indices = [idx for idx in (unk_idx, pad_idx) if idx is not None]
+
+    tokens = [word2idx.get(w, word2idx['<UNK>']) for w in start_words.split()]
+    if len(tokens) < block_size:
+        tokens = [word2idx['<PAD>']] * (block_size - len(tokens)) + tokens
+    else:
+        tokens = tokens[-block_size:]
+
+    x = torch.tensor(tokens, dtype=torch.long).unsqueeze(0).to(device)
+    generated = []
+    for _ in range(max_new_tokens):
+        with torch.no_grad():
+            logits = model(x)
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            for idx in mask_indices:
+                probs[:, idx] = 0.0
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+            next_token = torch.multinomial(probs, num_samples=1).item()
+        generated.append(idx2word[next_token])
+        x = torch.cat([x[:, 1:], torch.tensor([[next_token]], device=device)], dim=1)
+    return ' '.join(generated)
+
+
+# ==============================================================================
+# Main
+# ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Shakespeare training/generation")
-    parser.add_argument("--mode", choices=["train", "generate"], default="train")
-    parser.add_argument("--model", default="shakespeare")
-    parser.add_argument("--embed-dim", type=int, default=64)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--block-size", type=int, default=10)
-    parser.add_argument("--data", default="shakespeare_sample.txt")
-    parser.add_argument("--validation_ratio", type=float, default=0.05)
-    parser.add_argument("--vocab-mode", choices=["char", "word"], default="char")
+    parser = argparse.ArgumentParser(description='Train Neuralese Recurrence LM')
+    parser.add_argument('--data_file', type=str, default='shakespeare_works.txt')
+    parser.add_argument('--block_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--embed_dim', type=int, default=128)
+    parser.add_argument('--hidden_dim', type=int, default=256)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--num_passes', type=int, default=2)
+    parser.add_argument('--memory_slots', type=int, default=0)
+    parser.add_argument('--memory_dim', type=int, default=None)
+    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--lr_end', type=float, default=1e-5,
+                        help='Final LR for cosine schedule')
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--scheduler', type=str, default='cosine',
+                        choices=['step', 'cosine'])
+    parser.add_argument('--lr_decay', type=float, default=0.95,
+                        help='Step decay factor (only for step scheduler)')
+    parser.add_argument('--label_smoothing', type=float, default=0.0)
+    parser.add_argument('--min_freq', type=int, default=3)
+    parser.add_argument('--max_vocab', type=int, default=8000)
+    parser.add_argument('--device', type=str, default='cpu')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
+    parser.add_argument('--resume', type=str, default=None)
     args = parser.parse_args()
 
-    workdir = Path(args.model)
-    workdir.mkdir(exist_ok=True)
-    checkpoint_path = workdir / "checkpoint.pt"
-    vocab_path = workdir / "vocab.json"
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(exist_ok=True)
 
-    print(f"\n=== Loading data from {args.data} ===")
-    if args.vocab_mode == "char":
-        dataset = ShakespeareDataset(args.data, block_size=args.block_size)
-    else:  # word-level
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent))
-        from tokenizer import build_vocab, encode
-        vocab_data = json.load(open('shakespeare_works_vocab.json'))
-        stoi = vocab_data['stoi']
-        itos = vocab_data['itos']
-        encoded = encode(args.data, stoi, itos)
-        dataset = WordDataset(encoded, block_size=args.block_size)
-    
-    if hasattr(dataset, 'train_val_split'):
-        dataset.train_val_split(args.validation_ratio)
-    
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    
-    # Use dataset.validation_data for validation
-    val_loader = DataLoader(
-        dataset.validation_data,
-        batch_size=1,  # validation uses batch_size=1
-        shuffle=False
-    )
-    
-    print(f" Using device: {device}")
+    # Dataset
+    dataset = WordDataset(args.data_file, args.block_size,
+                          min_freq=args.min_freq, max_vocab=args.max_vocab)
+    print(f"  Vocab: {dataset.vocab_size} (min_freq={args.min_freq}, max_vocab={args.max_vocab}), "
+          f"Block size: {args.block_size}")
 
-    print(f"\n=== Creating model ===")
-    model = SimpleModel(
+    vocab_path = checkpoint_dir / 'vocab.json'
+    with open(vocab_path, 'w') as f:
+        json.dump(dataset.vocab, f)
+
+    data = dataset.data
+    split_idx = int(len(data) * 0.9)
+    train_tokens = data[:split_idx]
+    val_tokens = data[split_idx:]
+
+    class TokenSubset(Dataset):
+        def __init__(self, tokens, block_size):
+            self.tokens = tokens
+            self.block_size = block_size
+        def __len__(self):
+            return len(self.tokens) - self.block_size
+        def __getitem__(self, idx):
+            x = self.tokens[idx : idx + self.block_size]
+            y = self.tokens[idx + 1 : idx + self.block_size + 1]
+            return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
+
+    train_dataset = TokenSubset(train_tokens, args.block_size)
+    val_dataset = TokenSubset(val_tokens, args.block_size)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=True)
+
+    # Model
+    model = NeuraleseRecurrenceLM(
         vocab_size=dataset.vocab_size,
         embed_dim=args.embed_dim,
-        hidden_dim=args.hidden_dim
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_passes=args.num_passes,
+        memory_slots=args.memory_slots,
+        memory_dim=args.memory_dim,
+        dropout=args.dropout,
     ).to(device)
+    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
-    criterion = nn.CrossEntropyLoss()
+    # Loss
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=dataset.word2idx['<PAD>'],
+        label_smoothing=args.label_smoothing
+    )
 
-    if args.mode == "train":
-        print(f"\n=== Training for {args.epochs} epochs ===")
-        steps_per_epoch = dataset.__len__() // args.batch_size
-        total_steps = steps_per_epoch * dataset.block_size
-        print(f"  Data length: {dataset.__len__()}")
-        print(f"  Batch size: {args.batch_size}")
-        print(f"  Block size: {dataset.block_size}")
-        print(f"  Steps per epoch: {steps_per_epoch}")
-        print(f"  Est. total steps/epoch: {total_steps}")
-        print(f"  Est. tokens/epoch: {steps_per_epoch * dataset.block_size}")
-        print()
+    # Optimizer
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        for epoch in range(args.epochs):
-            total_loss = 0
-            step_count = 0
-            for batch_idx, (inputs, targets) in enumerate(loader):
-                step_count += 1
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs.view(-1, dataset.vocab_size), targets.view(-1))
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-                if step_count % 5 == 0:
-                    avg_step_loss = total_loss / step_count
-                    print(f"    Step {step_count}, Loss: {avg_step_loss:.4f}")
-        
-        if epoch % args.validation_freq == 0:
-            val_loss = 0
-            val_step = 0
-            model.eval()
-            with torch.no_grad():
-                for val_inputs, val_targets in val_loader:
-                    val_inputs, val_targets = val_inputs.to(device), val_targets.to(device)
-                    val_outputs = model(val_inputs)
-                    val_loss += criterion(val_outputs.view(-1, dataset.vocab_size), val_targets.view(-1)).item()
-            print(f"  Epoch {epoch} / {args.epochs}, Steps: {step_count} / {total_steps}, Avg Loss: {total_loss / step_count:.4f}")
+    # Scheduler
+    if args.scheduler == 'cosine':
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                         T_max=args.epochs,
+                                                         eta_min=args.lr_end)
+    else:
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.lr_decay)
 
-        print(f"\n=== Saving model to {checkpoint_path} ===")
-        checkpoint = {
-            "epoch": args.epochs,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        }
-        torch.save(checkpoint, checkpoint_path)
-        if args.vocab_mode == "char":
-            with open(vocab_path, 'w') as f:
-                json.dump({
-                    "stoi": dataset.stoi,
-                    "itos": dataset.itos,
-                    "vocab_size": dataset.vocab_size
-                }, f, indent=2)
-    elif args.mode == "generate":
-        print(f"\n=== Loading model from {checkpoint_path} ===")
-        if not checkpoint_path.exists():
-            print("  No checkpoint found! Train first with --mode train")
-            return
-        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        model.to(device)
-        model.eval()
-        print(f"\n=== Starting generation ===")
-        if args.vocab_mode == "char":
-            with open(vocab_path, 'r') as f:
-                vocab = json.load(f)
-            start_text = input("Enter starting text (or 'To be or not to be '):").strip()
-            if not start_text:
-                start_text = "To be or not to be "
-            start_ids = [vocab["stoi"].get(c, 0) for c in start_text]
-            current = torch.tensor([start_ids], dtype=torch.long)
-            max_new = 500
-            for i in range(max_new):
-                with torch.no_grad():
-                    last_id = int(current[-1, -1].item())
-                    last_tensor = torch.tensor([[last_id]], dtype=torch.long).to(device)
-                    outputs, _ = model.lstm(model.embedding(last_tensor))
-                    outputs = model.fc(outputs)
-                    next_id = int(torch.argmax(outputs[0, -1], dim=-1).item())
-                    current = torch.cat([current, torch.tensor([[next_id]], dtype=torch.long)], dim=1)
-                    if vocab["itos"].get(str(next_id), "") == "\n" or next_id >= vocab["vocab_size"]:
-                        break
-            result = ''.join([vocab["itos"][str(c)] for c in current[0].tolist()])
-            print(f"\n=== Generated text ===")
-            print(result)
-        else:  # word-level generation
-            with open(vocab_path, 'r') as f:
-                vocab = json.load(f)
-            print("Enter your starting text (words separated by spaces, e.g., 'To be or not to be '):")
-            start_text = input().strip()
-            start_ids = [vocab["stoi"].get(w, 0) for w in start_text.split()]
-            current = torch.tensor([start_ids], dtype=torch.long)
-            max_new = 50
-            for i in range(max_new):
-                with torch.no_grad():
-                    last_id = int(current[-1, -1].item())
-                    last_tensor = torch.tensor([[last_id]], dtype=torch.long).to(device)
-                    outputs, _ = model.lstm(model.embedding(last_tensor))
-                    outputs = model.fc(outputs)
-                    next_id = int(torch.argmax(outputs[0, -1], dim=-1).item())
-                    current = torch.cat([current, torch.tensor([[next_id]], dtype=torch.long)], dim=1)
-                    if vocab["itos"].get(next_id, "") in ["<PAD>", "<UNK>"]:
-                        break
-            result = ' '.join([vocab["itos"][w] if w < len(vocab["itos"]) else f"[ID:{w}]" for w in current[0].tolist()])
-            print(f"\n=== Generated text ===")
-            print(result)
+    start_epoch = 0
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        print(f"Resumed from epoch {start_epoch}")
+
+    for epoch in range(start_epoch, args.epochs):
+        start_time = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        val_loss = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+        elapsed = time.time() - start_time
+
+        print(f"Epoch {epoch+1:3d}/{args.epochs} | "
+              f"train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | "
+              f"time: {elapsed:.1f}s")
+
+        # Save checkpoint every 10 epochs and at the end
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
+            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'args': args,
+            }, checkpoint_path)
+
+    print("\nGenerating sample text...")
+    idx2word = {i: w for w, i in dataset.word2idx.items()}
+    sample = generate_text(
+        model, "To be or not to be",
+        dataset.word2idx, idx2word,
+        args.block_size, device,
+        max_new_tokens=100
+    )
+    print("Sample output:")
+    print(sample)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
