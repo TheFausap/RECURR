@@ -1,6 +1,6 @@
 """
 Train a Neuralese Recurrence language model on Shakespeare's works.
-With thought review: intra‑pass attention over previous neuralese states.
+With thought review, heavy regularisation, and early stopping.
 """
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ from pathlib import Path
 from collections import Counter
 import time
 import json
+import copy
 
 
 # ==============================================================================
@@ -114,16 +115,12 @@ class NeuraleseRecurrenceLM(nn.Module):
         self.num_passes = num_passes
         self.use_thought_review = use_thought_review
 
-        # Thought review attention (if enabled)
         if self.use_thought_review:
-            # 4 heads, hidden_dim must be divisible by num_heads (256/4=64)
             assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4 for thought review attention"
             self.thought_attn = nn.MultiheadAttention(embed_dim=hidden_dim,
                                                       num_heads=4,
                                                       dropout=dropout,
                                                       batch_first=True)
-
-        # Cross‑pass memory (optional)
         self.use_memory = memory_slots > 0
         if self.use_memory:
             if memory_dim is None:
@@ -143,36 +140,26 @@ class NeuraleseRecurrenceLM(nn.Module):
         h_in = self.dropout(h_in)
 
         h_state = None
-        thoughts = []   # stores outputs of previous passes for review
+        thoughts = []
 
         for pass_idx in range(self.num_passes):
             out, h_state = self.gru_cell(h_in, h_state)
 
-            # --- Thought review: attend over previous pass outputs ---
             if self.use_thought_review and pass_idx > 0:
-                # Stack previous thoughts: (b, s, num_prev, h)
-                prev = torch.stack(thoughts, dim=2)          # (b, s, k, h)
+                prev = torch.stack(thoughts, dim=2)      # (b, s, k, h)
                 b, s, k, h = prev.shape
-
-                # Flatten batch and sequence: treat each token independently
-                q = out.reshape(b * s, 1, h)                 # (b*s, 1, h)
-                kv = prev.reshape(b * s, k, h)               # (b*s, k, h)
-
-                attn_out, _ = self.thought_attn(q, kv, kv)   # (b*s, 1, h)
+                q = out.reshape(b * s, 1, h)
+                kv = prev.reshape(b * s, k, h)
+                attn_out, _ = self.thought_attn(q, kv, kv)
                 attn_out = attn_out.reshape(b, s, h)
-
-                # Add the reviewed context to the current output
                 out = out + self.dropout(attn_out)
 
-            # Store output for future passes
             thoughts.append(out)
 
-            # Prepare input for next pass (residual connection)
             if pass_idx < self.num_passes - 1:
                 residual = self.input_proj(emb)
                 h_in = self.dropout(out + residual)
 
-        # After all passes, `out` is the final representation.
         if self.use_memory:
             self.memory.update(out)
             queries = out.reshape(-1, out.size(-1))
@@ -187,7 +174,7 @@ class NeuraleseRecurrenceLM(nn.Module):
 
 
 # ==============================================================================
-# Training helpers (unchanged except UNK masking in generation)
+# Training helpers
 # ==============================================================================
 def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
@@ -256,8 +243,7 @@ def main():
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--hidden_dim', type=int, default=256)
     parser.add_argument('--num_layers', type=int, default=2)
-    parser.add_argument('--num_passes', type=int, default=3,
-                        help='Number of intra‑pass recurrence iterations')
+    parser.add_argument('--num_passes', type=int, default=3)
     parser.add_argument('--memory_slots', type=int, default=0)
     parser.add_argument('--memory_dim', type=int, default=None)
     parser.add_argument('--dropout', type=float, default=0.3)
@@ -265,13 +251,14 @@ def main():
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--lr_end', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine'])
+    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine', 'plateau'])
     parser.add_argument('--lr_decay', type=float, default=0.95)
     parser.add_argument('--label_smoothing', type=float, default=0.0)
     parser.add_argument('--min_freq', type=int, default=3)
     parser.add_argument('--max_vocab', type=int, default=8000)
-    parser.add_argument('--use_thought_review', action='store_true', default=False,
-                        help='Enable intra‑pass attention over previous neuralese states')
+    parser.add_argument('--use_thought_review', action='store_true', default=False)
+    parser.add_argument('--robust', action='store_true', default=False,
+                        help='Use heavy regularisation + plateau scheduler + early stopping')
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', type=str, default=None)
@@ -280,6 +267,15 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(exist_ok=True)
+
+    # Override with robust settings if requested
+    if args.robust:
+        args.label_smoothing = 0.1
+        args.dropout = 0.5
+        args.weight_decay = 1e-3
+        args.scheduler = 'plateau'
+        early_stop_patience = 20
+        print("Robust mode: label_smoothing=0.1, dropout=0.5, weight_decay=1e-3, scheduler=plateau, early_stop=20")
 
     # Dataset
     dataset = WordDataset(args.data_file, args.block_size,
@@ -293,7 +289,6 @@ def main():
     with open(vocab_path, 'w') as f:
         json.dump(dataset.vocab, f)
 
-    # Train / val split
     data = dataset.data
     split_idx = int(len(data) * 0.9)
     train_tokens = data[:split_idx]
@@ -330,49 +325,78 @@ def main():
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Loss & optimizer
     criterion = nn.CrossEntropyLoss(ignore_index=dataset.word2idx['<PAD>'],
                                     label_smoothing=args.label_smoothing)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if args.scheduler == 'cosine':
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                         T_max=args.epochs,
-                                                         eta_min=args.lr_end)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr_end)
+    elif args.scheduler == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     else:
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.lr_decay)
 
     start_epoch = 0
+    best_val_loss = float('inf')
+    best_model_state = None
+    no_improve = 0
+
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint and args.scheduler != 'plateau':
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"Resumed from epoch {start_epoch}")
 
-    # Training loop
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss = evaluate(model, val_loader, criterion, device)
-        scheduler.step()
+
+        # Scheduler step (plateau uses val_loss, others step each epoch)
+        if args.scheduler == 'plateau':
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
+
         elapsed = time.time() - start_time
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
               f"train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | "
               f"time: {elapsed:.1f}s")
 
+        # Early stopping / best model tracking
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if args.robust and no_improve >= early_stop_patience:
+            print(f"Early stopping triggered at epoch {epoch+1}")
+            break
+
+        # Save periodic checkpoint
         if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt"
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if args.scheduler != 'plateau' else None,
+                'best_val_loss': best_val_loss,
                 'args': args,
             }, checkpoint_path)
 
-    # Generation
+    # Load best model for generation
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print(f"Loaded best model with val loss: {best_val_loss:.4f}")
+
     print("\nGenerating sample text...")
     idx2word = {i: w for w, i in dataset.word2idx.items()}
     sample = generate_text(
