@@ -18,44 +18,32 @@ import copy
 # ==============================================================================
 # Space‑prefix BPE tokenizer (GPT‑2 style)
 # ==============================================================================
+# ==============================================================================
+# Original BPE tokenizer (preserves all characters, including whitespace)
+# ==============================================================================
 class BPETokenizer:
-    """Learns BPE with a space prepended to each word, ensuring word boundaries."""
     def __init__(self, vocab_size=4096):
         self.vocab_size = vocab_size
         self.pad_token = '<PAD>'
         self.unk_token = '<UNK>'
         self.special_tokens = [self.pad_token, self.unk_token]
         self.vocab = []
-        self.merges = []       # list of ((a,b), merged)
+        self.merges = []        # list of (pair, merged_token)
         self.id2sub = []
         self.sub2id = {}
 
-    def _word_to_chars(self, word, first=False):
-        """Return list of character tokens for a word, prepending a space unless it's the first."""
-        if first:
-            return list(word)
-        else:
-            return [' '] + list(word)
+    def _tokenize_to_chars(self, text):
+        return list(text)
 
     def train(self, text):
-        # Split into words, keep whitespace structure
-        words = text.split()
-        # We'll reconstruct with spaces between words
-        all_tokens = []
-        for i, word in enumerate(words):
-            if i == 0:
-                chars = self._word_to_chars(word, first=True)
-            else:
-                chars = self._word_to_chars(word, first=False)
-            all_tokens.extend(chars)
-
-        # Initial vocabulary: specials + all unique characters
-        unique_chars = sorted(set(all_tokens))
+        chars = self._tokenize_to_chars(text)
+        unique_chars = sorted(set(chars))
         self.vocab = self.special_tokens + unique_chars
         self.id2sub = list(self.vocab)
         self.sub2id = {s: i for i, s in enumerate(self.vocab)}
-        tokens = all_tokens[:]
+        self.merges = []
 
+        tokens = chars[:]
         num_merges = self.vocab_size - len(self.vocab)
         for _ in range(num_merges):
             pair_counts = Counter()
@@ -86,17 +74,8 @@ class BPETokenizer:
             tokens = new_tokens
 
     def encode(self, text):
-        words = text.split()
-        all_tokens = []
-        for i, word in enumerate(words):
-            if i == 0:
-                chars = self._word_to_chars(word, first=True)
-            else:
-                chars = self._word_to_chars(word, first=False)
-            all_tokens.extend(chars)
-
-        # Apply learned merges
-        tokens = all_tokens[:]
+        chars = self._tokenize_to_chars(text)
+        tokens = chars[:]
         for pair, merged in self.merges:
             new_tokens = []
             i = 0
@@ -108,20 +87,13 @@ class BPETokenizer:
                     new_tokens.append(tokens[i])
                     i += 1
             tokens = new_tokens
-        return [self.sub2id.get(tok, 1) for tok in tokens]
+        return [self.sub2id.get(tok, 1) for tok in tokens]   # 1 = UNK
 
     def decode(self, ids):
         subwords = [self.id2sub[i] for i in ids if i < len(self.id2sub)]
-        # Remove leading space if present (it's added during encoding)
-        text = ''.join(subwords)
-        if text.startswith(' '):
-            text = text[1:]
-        return text
+        return ''.join(subwords)
 
 
-# ==============================================================================
-# Dataset
-# ==============================================================================
 class BPEDataset(Dataset):
     def __init__(self, file_path, block_size, bpe_vocab_size=4096, tokenizer_cache=None):
         self.block_size = block_size
