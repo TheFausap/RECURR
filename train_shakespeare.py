@@ -1,6 +1,6 @@
 """
-Train a Neuralese Recurrence language model on Shakespeare using BPE tokenization.
-Self-contained BPE tokenizer – no external dependencies.
+Train a Neuralese Recurrence language model with space‑prefix BPE tokenization.
+Clean generation, scalable to any text dataset.
 """
 import torch
 import torch.nn as nn
@@ -9,125 +9,53 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import argparse
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter
 import time
 import json
 import copy
-import re
 
 
 # ==============================================================================
-# Self-contained BPE tokenizer
+# Space‑prefix BPE tokenizer (GPT‑2 style)
 # ==============================================================================
 class BPETokenizer:
-    """
-    A minimal byte-pair encoding tokenizer that learns subword units from text.
-    """
+    """Learns BPE with a space prepended to each word, ensuring word boundaries."""
     def __init__(self, vocab_size=4096):
         self.vocab_size = vocab_size
-        # special tokens: PAD=0, UNK=1
         self.pad_token = '<PAD>'
         self.unk_token = '<UNK>'
         self.special_tokens = [self.pad_token, self.unk_token]
-        self.vocab = []          # list of subword strings
-        self.merges = {}         # mapping (a,b) -> new token string
-        self.id2sub = []         # id -> subword string
-        self.sub2id = {}         # subword -> id
+        self.vocab = []
+        self.merges = []       # list of ((a,b), merged)
+        self.id2sub = []
+        self.sub2id = {}
 
-    def _tokenize_to_chars(self, text):
-        """Split text into characters, preserving whitespace."""
-        # Add a special space marker so that whitespace is preserved in merges
-        # We'll treat spaces as a regular character.
-        return list(text)
+    def _word_to_chars(self, word, first=False):
+        """Return list of character tokens for a word, prepending a space unless it's the first."""
+        if first:
+            return list(word)
+        else:
+            return [' '] + list(word)
 
     def train(self, text):
-        """Learn BPE merges from the full text."""
-        chars = self._tokenize_to_chars(text)
-        # Initial vocabulary: all unique characters + special tokens
-        unique_chars = sorted(set(chars))
+        # Split into words, keep whitespace structure
+        words = text.split()
+        # We'll reconstruct with spaces between words
+        all_tokens = []
+        for i, word in enumerate(words):
+            if i == 0:
+                chars = self._word_to_chars(word, first=True)
+            else:
+                chars = self._word_to_chars(word, first=False)
+            all_tokens.extend(chars)
+
+        # Initial vocabulary: specials + all unique characters
+        unique_chars = sorted(set(all_tokens))
         self.vocab = self.special_tokens + unique_chars
         self.id2sub = list(self.vocab)
         self.sub2id = {s: i for i, s in enumerate(self.vocab)}
+        tokens = all_tokens[:]
 
-        # Convert text to list of token IDs (as strings for now, to allow merging)
-        tokens = chars[:]   # list of characters (strings)
-
-        # Iteratively merge most frequent pair
-        num_merges = self.vocab_size - len(self.vocab)
-        for _ in range(num_merges):
-            # Count adjacent pairs
-            pair_counts = Counter()
-            for i in range(len(tokens) - 1):
-                pair = (tokens[i], tokens[i+1])
-                pair_counts[pair] += 1
-            if not pair_counts:
-                break
-            # Find the most frequent pair
-            best_pair = max(pair_counts, key=pair_counts.get)
-            if pair_counts[best_pair] < 2:   # stop if no repeated pairs
-                break
-            # Create new token by concatenating the pair
-            new_token = best_pair[0] + best_pair[1]
-            self.merges[best_pair] = new_token
-            self.vocab.append(new_token)
-            self.id2sub.append(new_token)
-            new_id = len(self.id2sub) - 1
-            self.sub2id[new_token] = new_id
-
-            # Apply merge to the token list
-            new_tokens = []
-            i = 0
-            while i < len(tokens):
-                if i < len(tokens) - 1 and (tokens[i], tokens[i+1]) == best_pair:
-                    new_tokens.append(new_token)
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
-                    i += 1
-            tokens = new_tokens
-
-        # Final vocabulary: specials + subwords
-        self.vocab = self.id2sub
-        self.sub2id = {s: i for i, s in enumerate(self.id2sub)}
-
-    def encode(self, text):
-        """Tokenize text into list of subword IDs."""
-        chars = self._tokenize_to_chars(text)
-        tokens = chars[:]
-        # Apply merges in order (the order they were learned matters)
-        # Since we stored merges in a dict, we lost order. We need the order.
-        # We can store merges as a list of (pair, new_token) during training.
-        # I'll modify train to store self.merge_list.
-        for pair, merged in self.merge_list:
-            new_tokens = []
-            i = 0
-            while i < len(tokens):
-                if i < len(tokens) - 1 and tokens[i] == pair[0] and tokens[i+1] == pair[1]:
-                    new_tokens.append(merged)
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
-                    i += 1
-            tokens = new_tokens
-        return [self.sub2id.get(tok, 1) for tok in tokens]  # 1 = UNK
-
-    def decode(self, ids):
-        """Convert list of IDs back to text."""
-        subwords = [self.id2sub[i] for i in ids if i < len(self.id2sub)]
-        return ''.join(subwords)
-
-
-class BPETokenizerWithOrder(BPETokenizer):
-    """Extension to keep merge order for encoding."""
-    def train(self, text):
-        chars = self._tokenize_to_chars(text)
-        unique_chars = sorted(set(chars))
-        self.vocab = self.special_tokens + unique_chars
-        self.id2sub = list(self.vocab)
-        self.sub2id = {s: i for i, s in enumerate(self.vocab)}
-        self.merge_list = []   # list of (pair, merged_token)
-
-        tokens = chars[:]
         num_merges = self.vocab_size - len(self.vocab)
         for _ in range(num_merges):
             pair_counts = Counter()
@@ -140,11 +68,12 @@ class BPETokenizerWithOrder(BPETokenizer):
             if pair_counts[best_pair] < 2:
                 break
             new_token = best_pair[0] + best_pair[1]
-            self.merge_list.append( (best_pair, new_token) )
+            self.merges.append((best_pair, new_token))
             self.vocab.append(new_token)
             self.id2sub.append(new_token)
             self.sub2id[new_token] = len(self.id2sub)-1
 
+            # Apply merge
             new_tokens = []
             i = 0
             while i < len(tokens):
@@ -157,9 +86,18 @@ class BPETokenizerWithOrder(BPETokenizer):
             tokens = new_tokens
 
     def encode(self, text):
-        chars = self._tokenize_to_chars(text)
-        tokens = chars[:]
-        for pair, merged in self.merge_list:
+        words = text.split()
+        all_tokens = []
+        for i, word in enumerate(words):
+            if i == 0:
+                chars = self._word_to_chars(word, first=True)
+            else:
+                chars = self._word_to_chars(word, first=False)
+            all_tokens.extend(chars)
+
+        # Apply learned merges
+        tokens = all_tokens[:]
+        for pair, merged in self.merges:
             new_tokens = []
             i = 0
             while i < len(tokens):
@@ -174,11 +112,15 @@ class BPETokenizerWithOrder(BPETokenizer):
 
     def decode(self, ids):
         subwords = [self.id2sub[i] for i in ids if i < len(self.id2sub)]
-        return ''.join(subwords)
+        # Remove leading space if present (it's added during encoding)
+        text = ''.join(subwords)
+        if text.startswith(' '):
+            text = text[1:]
+        return text
 
 
 # ==============================================================================
-# Dataset using BPE
+# Dataset
 # ==============================================================================
 class BPEDataset(Dataset):
     def __init__(self, file_path, block_size, bpe_vocab_size=4096, tokenizer_cache=None):
@@ -186,18 +128,16 @@ class BPEDataset(Dataset):
         with open(file_path, 'r', encoding='utf-8') as f:
             text = f.read()
 
-        self.tokenizer = BPETokenizerWithOrder(vocab_size=bpe_vocab_size)
+        self.tokenizer = BPETokenizer(vocab_size=bpe_vocab_size)
 
         if tokenizer_cache and Path(tokenizer_cache).exists():
-            # Load cached tokenizer
             with open(tokenizer_cache, 'r') as f:
                 data = json.load(f)
             self.tokenizer.vocab = data['vocab']
             self.tokenizer.id2sub = data['id2sub']
             self.tokenizer.sub2id = data['sub2id']
-            self.tokenizer.merge_list = [((p[0],p[1]), m) for p,m in data['merges']]
+            self.tokenizer.merges = [((p[0], p[1]), m) for p, m in data['merges']]
         else:
-            # Train tokenizer on full text
             print("Training BPE tokenizer...")
             self.tokenizer.train(text)
             if tokenizer_cache:
@@ -206,11 +146,10 @@ class BPEDataset(Dataset):
                         'vocab': self.tokenizer.vocab,
                         'id2sub': self.tokenizer.id2sub,
                         'sub2id': self.tokenizer.sub2id,
-                        'merges': [(list(pair), merged) for pair, merged in self.tokenizer.merge_list]
+                        'merges': [(list(pair), merged) for pair, merged in self.tokenizer.merges]
                     }, f)
                 print(f"Tokenizer saved to {tokenizer_cache}")
 
-        # Encode entire text
         self.data = self.tokenizer.encode(text)
         self.vocab_size = len(self.tokenizer.vocab)
         print(f"BPE vocabulary size: {self.vocab_size}")
@@ -223,12 +162,9 @@ class BPEDataset(Dataset):
         y = self.data[idx + 1 : idx + self.block_size + 1]
         return torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
 
-    def decode(self, ids):
-        return self.tokenizer.decode(ids)
-
 
 # ==============================================================================
-# Model (unchanged thought review architecture)
+# Model (same thought‑review architecture)
 # ==============================================================================
 class IterativeGRU(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers):
@@ -283,7 +219,7 @@ class NeuraleseRecurrenceLM(nn.Module):
         self.num_passes = num_passes
         self.use_thought_review = use_thought_review
         if self.use_thought_review:
-            assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4 for thought review"
+            assert hidden_dim % 4 == 0
             self.thought_attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4,
                                                       dropout=dropout, batch_first=True)
         self.use_memory = memory_slots > 0
@@ -329,7 +265,7 @@ class NeuraleseRecurrenceLM(nn.Module):
 
 
 # ==============================================================================
-# Training helpers (generation adapted for BPE)
+# Training helpers (with top‑p generation)
 # ==============================================================================
 def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
@@ -359,47 +295,59 @@ def evaluate(model, dataloader, criterion, device):
 
 
 def generate_text(model, start_text, dataset, block_size, device,
-                  max_new_tokens=200, temperature=0.8):
-    """Generate text using BPE tokenizer. start_text can be any string."""
+                  max_new_tokens=200, temperature=0.8, top_p=0.9,
+                  repetition_penalty=1.1):
     model.eval()
-    # Encode start text into BPE tokens
-    token_ids = dataset.tokenizer.encode(start_text)
-    # Pad or truncate to block_size
-    pad_id = dataset.tokenizer.sub2id['<PAD>']
-    if len(token_ids) < block_size:
-        token_ids = [pad_id] * (block_size - len(token_ids)) + token_ids
-    else:
-        token_ids = token_ids[-block_size:]
-    x = torch.tensor(token_ids, dtype=torch.long).unsqueeze(0).to(device)
+    tokenizer = dataset.tokenizer
+    pad_id = 0
+    unk_id = 1
 
-    generated_ids = []
+    start_ids = tokenizer.encode(start_text)
+    if len(start_ids) > block_size:
+        start_ids = start_ids[-block_size:]
+    else:
+        start_ids = [pad_id] * (block_size - len(start_ids)) + start_ids
+
+    x = torch.tensor(start_ids, dtype=torch.long).unsqueeze(0).to(device)
+    generated = []
+
     for _ in range(max_new_tokens):
         with torch.no_grad():
             logits = model(x)
             logits = logits[:, -1, :] / temperature
+
+            # Repetition penalty
+            for token_id in set(generated[-10:]):
+                if token_id not in (pad_id, unk_id):
+                    logits[:, token_id] /= repetition_penalty
+
             probs = F.softmax(logits, dim=-1)
-            # Mask PAD and UNK (UNK very unlikely anyway)
-            for idx in [0, 1]:   # PAD=0, UNK=1
-                if idx < probs.size(-1):
-                    probs[:, idx] = 0.0
+            probs[:, pad_id] = 0.0
+            probs[:, unk_id] = 0.0
+
+            # Top‑p filtering
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative_probs > top_p
+            sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+            sorted_mask[..., 0] = 0
+            mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+            probs[mask] = 0.0
             probs = probs / probs.sum(dim=-1, keepdim=True)
+
             next_token = torch.multinomial(probs, num_samples=1).item()
-        generated_ids.append(next_token)
-        # Shift context window
+        generated.append(next_token)
         x = torch.cat([x[:, 1:], torch.tensor([[next_token]], device=device)], dim=1)
 
-    # Decode to text
-    full_output = dataset.decode(token_ids[-block_size:] + generated_ids)
-    # The output includes the initial context; we can just return the new part.
-    # For simplicity, return everything after the start_text.
-    return full_output
+    new_text = tokenizer.decode(generated)
+    return new_text
 
 
 # ==============================================================================
 # Main
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description='Train Neuralese Recurrence LM with BPE')
+    parser = argparse.ArgumentParser()
     parser.add_argument('--data_file', type=str, default='shakespeare_works.txt')
     parser.add_argument('--block_size', type=int, default=32)
     parser.add_argument('--batch_size', type=int, default=64)
@@ -409,37 +357,34 @@ def main():
     parser.add_argument('--num_passes', type=int, default=3)
     parser.add_argument('--memory_slots', type=int, default=0)
     parser.add_argument('--memory_dim', type=int, default=None)
-    parser.add_argument('--dropout', type=float, default=0.3)
+    parser.add_argument('--dropout', type=float, default=0.4)
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--lr_end', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--scheduler', type=str, default='cosine', choices=['step', 'cosine'])
+    parser.add_argument('--scheduler', type=str, default='cosine')
     parser.add_argument('--lr_decay', type=float, default=0.95)
-    parser.add_argument('--label_smoothing', type=float, default=0.0)
-    parser.add_argument('--bpe_vocab_size', type=int, default=4096,
-                        help='Vocabulary size for BPE tokenizer')
-    parser.add_argument('--tokenizer_cache', type=str, default='bpe_tokenizer.json',
-                        help='Cache file for trained BPE tokenizer')
+    parser.add_argument('--label_smoothing', type=float, default=0.05)
+    parser.add_argument('--bpe_vocab_size', type=int, default=4096)
+    parser.add_argument('--tokenizer_cache', type=str, default='bpe_tokenizer.json')
     parser.add_argument('--use_thought_review', action='store_true', default=True)
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--refine', action='store_true', default=False,
-                    help='Load checkpoint and refine with plateau scheduler + early stopping')
+    parser.add_argument('--refine', action='store_true', default=False)
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(exist_ok=True)
 
-    # Dataset with BPE
+    # Dataset
     dataset = BPEDataset(args.data_file, args.block_size,
                          bpe_vocab_size=args.bpe_vocab_size,
                          tokenizer_cache=args.tokenizer_cache)
     print(f"  BPE vocab: {dataset.vocab_size}, Block size: {args.block_size}")
 
-    # Split token sequence 90/10
+    # Split
     data = dataset.data
     split_idx = int(len(data) * 0.9)
     train_tokens = data[:split_idx]
@@ -476,12 +421,13 @@ def main():
     ).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Loss (ignore PAD id 0)
     criterion = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=args.label_smoothing)
     optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     if args.scheduler == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.lr_end)
+    elif args.scheduler == 'plateau':
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     else:
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.lr_decay)
 
@@ -492,7 +438,7 @@ def main():
     early_stop_patience = 30
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         if 'scheduler_state_dict' in checkpoint and args.scheduler != 'plateau':
@@ -502,32 +448,36 @@ def main():
         print(f"Resumed from epoch {start_epoch}")
 
     if args.refine:
-        args.lr = 1e-4   # lower learning rate
-        args.epochs = start_epoch + 30   # only a few more epochs
+        args.lr = 1e-4
+        args.epochs = start_epoch + 30
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
         early_stop_patience = 10
-        print("Refinement mode: lowered LR to 1e-4, using plateau scheduler, early stop=10")
+        print("Refinement mode: LR=1e-4, plateau scheduler, early stop=10")
 
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss = evaluate(model, val_loader, criterion, device)
-        if args.refine:
+
+        if args.scheduler == 'plateau' or args.refine:
             scheduler.step(val_loss)
         else:
             scheduler.step()
+
         elapsed = time.time() - start_time
+        print(f"Epoch {epoch+1:3d}/{args.epochs} | train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | time: {elapsed:.1f}s")
 
-        print(f"Epoch {epoch+1:3d}/{args.epochs} | "
-              f"train loss: {train_loss:.4f} | val loss: {val_loss:.4f} | "
-              f"time: {elapsed:.1f}s")
-
-        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = copy.deepcopy(model.state_dict())
             no_improve = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'best_val_loss': best_val_loss,
+                'args': args,
+            }, checkpoint_dir / 'best_model.pt')
         else:
             no_improve += 1
             if no_improve >= early_stop_patience:
