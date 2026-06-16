@@ -425,6 +425,8 @@ def main():
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--refine', action='store_true', default=False,
+                    help='Load checkpoint and refine with plateau scheduler + early stopping')
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
@@ -499,11 +501,22 @@ def main():
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         print(f"Resumed from epoch {start_epoch}")
 
+    if args.refine:
+        args.lr = 1e-4   # lower learning rate
+        args.epochs = start_epoch + 30   # only a few more epochs
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        early_stop_patience = 10
+        print("Refinement mode: lowered LR to 1e-4, using plateau scheduler, early stop=10")
+
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
         val_loss = evaluate(model, val_loader, criterion, device)
-        scheduler.step()
+        if args.refine:
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
         elapsed = time.time() - start_time
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
